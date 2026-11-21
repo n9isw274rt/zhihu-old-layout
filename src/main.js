@@ -2,61 +2,83 @@
 原理（2026-11 实测）：
 zhihu 服务端把 A/B 实验结果内联在 <script id="js-initialData" type="text/json"> 里：
   initialState.env.abV2.config.paramMap.wm_pc_Layout = { value: "1", abId: "PC_Layout_final1-3" }
-前端读到 value==="1" 就渲染新版「T 形」布局（LeanAppHeaderBar + 左侧浮动图标栏），
+前端读到 value==="1" 就渲染新版「T 形」布局（LeanAppHeaderBar + 左侧浮动图标栏 + 加宽内容区），
 否则渲染经典 AppHeader 布局。把 value 改成 "0" 即可。
 
-时序（这才是本脚本的核心，别想当然）：
-document-start 执行时 <script id="js-initialData"> 还不存在——它是解析器之后才插入的节点，
-没有任何脚本能在它出现之前改它。所以这里分三步：
-  1) 立刻用 CSS 把 SSR 已经吐出来的新版头部遮住（HTML 已经到达浏览器，只能遮，拦不住）；
-  2) 用 MutationObserver 盯着解析过程，节点一出现就同步改值——这发生在解析期，
-     早于所有 defer/async 脚本执行，因此不依赖「知乎恰好在 DOMContentLoaded 之后才读」；
-  3) 等经典布局真的渲染出来再揭开，超时兜底。
-DOMContentLoaded 只当兜底：万一观察路径没命中（比如元素被 innerHTML 批量插入），还能补一次。
-若知乎改版导致 key 不存在，脚本不遮任何东西，页面保持原样。
+为什么必须"冻整页"而不是只遮头部：
+SSR 的 HTML 已经把新版布局画好了，且新版和旧版的差异不止头部——内容区宽度、右侧栏、左侧
+浮动图标栏一起变。只遮 .LeanAppHeaderBar 的话，用户仍会看到一帧"新版排布"，就是那个闪一下。
+
+时序（三层，缺一不可）：
+  1) document-start 立刻把 <html> 冻住（inline visibility:hidden），任何一帧都不给看；
+  2) MutationObserver 盯解析过程，<script id="js-initialData"> 一插入就改值——早于所有
+     defer/async 脚本执行，所以不依赖"知乎恰好在 DOMContentLoaded 之后才读"；
+  3) 等 .AppHeader（经典头部）真的出现，再解冻；超时兜底，绝不让页面一直白着。
+另外留一条只针对 .LeanAppHeaderBar 的常驻 CSS，防的是客户端二次渲染把新版头部又画出来。
+
+若知乎改版导致 key 不存在：DOMContentLoaded 时立刻解冻，页面保持原样，不留白屏。
 */
 
 (function () {
   'use strict';
 
   var KEY = 'wm_pc_Layout';
-  var HIDE_MAX_MS = 4000;      // 补丁失效时的兜底：别让用户一直看着空白头部
-  var CLASSIC_WAIT_MS = 4000;
+  var FREEZE_MAX_MS = 3000;    // 冻住的上限：超过就放行，宁可闪一下也不让用户看白屏
+  var CLASSIC_POLL_MS = 32;
 
-  var styleEl = null;
-  var failTimer = null;
+  var maskEl = null;
+  var frozen = false;
+  var freezeTimer = null;
   var mo = null;
   var patched = false;
   var warned = false;
 
-  /* ---------- 1. 遮住 SSR 出来的新版头部 ---------- */
+  /* ---------- 1. 冻住整页 ---------- */
 
-  // 首屏 SSR 出来的是新版头部，先把它藏起来，避免约 0.5s 的布局闪烁。
-  // 不能挂 class 到 <html>：React 会接管 html 的 class 属性并把它冲掉。
-  function hideNew() {
-    if (styleEl) return;
-    var root = document.head || document.documentElement;
-    if (!root) { setTimeout(hideNew, 1); return; }   // document-start 时可能还没有任何节点
-    try {
-      styleEl = document.createElement('style');
-      styleEl.textContent =
-        '.LeanAppHeaderBar,.GlobalSideBar{visibility:hidden !important}';
-      root.appendChild(styleEl);
-    } catch (e) {
-      styleEl = null;
-      return;
+  // 用 inline style + important：不依赖 <head> 存在，也不用等样式表加载
+  function freeze() {
+    if (frozen) return true;
+    var de = document.documentElement;
+    if (!de) {
+      // <html> 还没被解析器创建：等它一出现立刻冻（MutationObserver 走微任务，比 setTimeout 早）
+      var boot = new MutationObserver(function () {
+        if (freeze()) boot.disconnect();
+      });
+      boot.observe(document, { childList: true, subtree: true });
+      return false;
     }
-    clearTimeout(failTimer);
-    failTimer = setTimeout(unhide, HIDE_MAX_MS);
+    de.style.setProperty('visibility', 'hidden', 'important');
+    frozen = true;
+    freezeTimer = setTimeout(unfreeze, FREEZE_MAX_MS);
+    return true;
   }
 
-  function unhide() {
-    clearTimeout(failTimer);
-    if (styleEl && styleEl.parentNode) styleEl.parentNode.removeChild(styleEl);
-    styleEl = null;
+  function unfreeze() {
+    clearTimeout(freezeTimer);
+    if (!frozen) return;
+    var de = document.documentElement;
+    if (de) de.style.removeProperty('visibility');
+    frozen = false;
   }
 
-  /* ---------- 2. 解析期就地改开关 ---------- */
+  /* ---------- 2. 常驻遮罩：只针对新版头部 ---------- */
+
+  // 解冻之后如果客户端又把新版头部画出来（二次渲染/接口回填），这一条兜住。
+  // 只保留 .LeanAppHeaderBar：它是新版独有的，不会误伤经典布局。
+  function installMask() {
+    if (maskEl) return;
+    var root = document.head || document.documentElement;
+    if (!root) { setTimeout(installMask, 1); return; }
+    try {
+      maskEl = document.createElement('style');
+      maskEl.textContent = '.LeanAppHeaderBar{visibility:hidden !important}';
+      root.appendChild(maskEl);
+    } catch (e) {
+      maskEl = null;
+    }
+  }
+
+  /* ---------- 3. 解析期就地改开关 ---------- */
 
   function patchEl(el) {
     try {
@@ -64,15 +86,13 @@ DOMContentLoaded 只当兜底：万一观察路径没命中（比如元素被 in
       var env = data && data.initialState && data.initialState.env;
       var pm = env && env.abV2 && env.abV2.config && env.abV2.config.paramMap;
       if (!pm || !pm[KEY]) return false;
-      // 已经是非实验组就别白改一遍，省一次 JSON.stringify
-      if (String(pm[KEY].value) === '1') {
+      if (String(pm[KEY].value) === '1') {   // 已经是非实验组就别白改一遍
         pm[KEY].value = '0';
         el.textContent = JSON.stringify(data);
       }
       return true;
     } catch (e) {
-      // 解析期观察器可能在文本还没全部插进来时就被触发（长内联脚本会分片插入），
-      // 这时 JSON.parse 必然失败，等下一次 mutation 重试即可，别刷屏。
+      // 长内联脚本会分片插入，文本没插全时 JSON.parse 必然失败，等下次 mutation 重试即可
       if (!warned) { warned = true; console.warn('[知乎旧版布局] 补丁失败：', e); }
       return false;
     }
@@ -87,44 +107,58 @@ DOMContentLoaded 只当兜底：万一观察路径没命中（比如元素被 in
     return patched;
   }
 
-  // 观察整棵 document（document-start 时 document 一定存在，documentElement 不一定）
+  // 观察整棵 document：document-start 时 document 一定在，documentElement 不一定
   function startWatch() {
     if (mo) return;
     mo = new MutationObserver(function () { patchNow(); });
     mo.observe(document, { childList: true, subtree: true });
-    patchNow();
+    patchNow();   // 万一注入时已经解析过了
   }
 
   function stopWatch() {
     if (mo) { mo.disconnect(); mo = null; }
   }
 
-  /* ---------- 3. 等经典布局渲染出来再揭开 ---------- */
+  /* ---------- 4. 经典布局到位才解冻 ---------- */
 
-  function whenClassicRender() {
-    if (document.querySelector('.AppHeader')) { unhide(); return; }
-    var tries = 0;
-    var maxTries = Math.ceil(CLASSIC_WAIT_MS / 50);
-    var timer = setInterval(function () {
-      tries++;
-      if (document.querySelector('.AppHeader') || tries > maxTries) {
-        clearInterval(timer);
-        unhide();
-      }
-    }, 50);
+  // 解冻条件（在 DCL 之后才判定，此时 SSR 结构已经稳定）：
+  //   a) 经典头部 .AppHeader 出现；或
+  //   b) 新版头部 .LeanAppHeaderBar 已经不在 DOM 里（说明本页本来就不是新版布局，
+  //      或 React 已经把它换掉了）—— 避免在没有经典头部的页面上白白冻满 3 秒。
+  function classicReady() {
+    return !!document.querySelector('.AppHeader') || !document.querySelector('.LeanAppHeaderBar');
+  }
+
+  function pollClassic() {
+    var done = false;
+    function check() {
+      if (done) return true;
+      if (classicReady()) { done = true; unfreeze(); return true; }
+      return false;
+    }
+    if (check()) return;
+    // rAF 最早（下一帧），setInterval 兜住 rAF 被节流的情况（后台标签页）
+    (function tick() {
+      if (check()) return;
+      requestAnimationFrame(tick);
+    })();
+    var iv = setInterval(function () {
+      if (check()) clearInterval(iv);
+    }, CLASSIC_POLL_MS);
   }
 
   /* ---------- 启动 ---------- */
 
   function onReady() {
     if (!patched) patchNow();       // 兜底：观察器没命中时再补一次
-    stopWatch();                    // 之后不再需要盯解析过程
-    if (!patched) { unhide(); return; }   // 没有这个开关（知乎改版）→ 立刻还原，不留空白
-    whenClassicRender();
+    stopWatch();
+    if (!patched) { unfreeze(); return; }   // 开关不存在（知乎改版）→ 立刻放行，不留白屏
+    pollClassic();
   }
 
   function start() {
-    hideNew();
+    freeze();
+    installMask();
     startWatch();
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', onReady, true);
