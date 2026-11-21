@@ -1,0 +1,4 @@
+# 统一 LF：元数据块被 CRLF 折腾过一次就很难查
+* text=auto eol=lf
+*.user.js text eol=lf
+*.meta.js text eol=lf

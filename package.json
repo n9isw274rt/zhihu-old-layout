@@ -1,0 +1,15 @@
+{
+  "name": "zhihu-old-layout-userscript",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "知乎网页版 · 恢复旧版布局（Tampermonkey 用户脚本）",
+  "repository": "github:n9isw274rt/zhihu-old-layout",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "release": "node scripts/build.mjs --version"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
